@@ -401,6 +401,10 @@ class CanvasView(QGraphicsView):
         self.temp_polygon_redo_stack: List[List[QPointF]] = []
         self.zoom_factor = 1.0
         self.pan_offset = QPointF(0, 0)
+        self._is_panning = False
+        self._last_pan_view_pos = QPoint()
+        self.mouse_pan_speed = 1.0
+        self.gesture_pan_speed = 0.6
 
     def set_tool(self, tool: str):
         self.current_tool = tool
@@ -476,6 +480,13 @@ class CanvasView(QGraphicsView):
                 painter.drawEllipse(r)
 
     def mouseMoveEvent(self, event):
+        if self._is_panning:
+            delta = event.pos() - self._last_pan_view_pos
+            self._last_pan_view_pos = QPoint(event.pos())
+            self._pan_by_view_delta(delta.x(), delta.y(), speed=self.mouse_pan_speed, invert=True)
+            event.accept()
+            return
+
         scene_pos = self.mapToScene(event.pos())
         self.last_scene_mouse_pos = QPointF(scene_pos)
         self.cursorMovedInScene.emit(scene_pos)
@@ -496,10 +507,17 @@ class CanvasView(QGraphicsView):
     def mousePressEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
 
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._is_panning = True
+            self._last_pan_view_pos = QPoint(event.pos())
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+
         if event.button() == Qt.MouseButton.RightButton:
-            self.set_tool("select")
-            self.scene().clearSelection()
-            self.contentChanged.emit()
+            self._is_panning = True
+            self._last_pan_view_pos = QPoint(event.pos())
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
 
@@ -541,6 +559,12 @@ class CanvasView(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton) and self._is_panning:
+            self._is_panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+
         if event.button() == Qt.MouseButton.LeftButton and self.current_tool in ("rect", "ellipse"):
             if self.temp_rect_start and self.temp_rect_current:
                 r = QRectF(self.temp_rect_start, self.temp_rect_current).normalized()
@@ -558,22 +582,62 @@ class CanvasView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QWheelEvent):
-        # Touchpad pinch on Windows often arrives as wheel deltas. Keep it simple and always zoom the input view.
-        delta = event.angleDelta().y()
-        if delta == 0 and not event.pixelDelta().isNull():
-            delta = event.pixelDelta().y()
+        pixel_delta = event.pixelDelta()
+        angle_delta = event.angleDelta()
+        wants_zoom = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        source = event.source()
+
+        # On Windows touchpads, two-finger drag/scroll often comes through as a synthesized
+        # wheel event. Treat those as panning unless Ctrl is held explicitly for zoom.
+        is_touchpad_like = (
+            not pixel_delta.isNull()
+            or source != Qt.MouseEventSource.MouseEventNotSynthesized
+        )
+
+        if not wants_zoom and is_touchpad_like:
+            dx = pixel_delta.x() if not pixel_delta.isNull() else angle_delta.x() / 4.0
+            dy = pixel_delta.y() if not pixel_delta.isNull() else angle_delta.y() / 4.0
+            if dx or dy:
+                self._pan_by_view_delta(dx, dy, speed=self.gesture_pan_speed, invert=True)
+                event.accept()
+                return
+
+        # Keep regular mouse-wheel zoom, and also allow Ctrl + touchpad gesture zoom.
+        delta = angle_delta.y()
+        if delta == 0 and not pixel_delta.isNull():
+            delta = pixel_delta.y()
         if delta:
-            factor = 1.12 if delta > 0 else 1 / 1.12
-            new_zoom = clamp(self.zoom_factor * factor, 0.15, 20.0)
-            factor = new_zoom / self.zoom_factor
-            self.zoom_factor = new_zoom
-            self.scale(factor, factor)
-            center = self.mapToScene(self.viewport().rect().center())
-            self.pan_offset = center
-            self.contentChanged.emit()
+            self._apply_zoom_delta(delta)
             event.accept()
             return
         super().wheelEvent(event)
+
+    def _apply_zoom_delta(self, delta: float):
+        factor = 1.12 if delta > 0 else 1 / 1.12
+        new_zoom = clamp(self.zoom_factor * factor, 0.15, 20.0)
+        factor = new_zoom / self.zoom_factor
+        self.zoom_factor = new_zoom
+        self.scale(factor, factor)
+        center = self.mapToScene(self.viewport().rect().center())
+        self.pan_offset = center
+        self.contentChanged.emit()
+
+    def _pan_by_view_delta(self, dx: float, dy: float, speed: float = 1.0, invert: bool = False):
+        if invert:
+            dx = -dx
+            dy = -dy
+
+        current_center_view = self.viewport().rect().center()
+        current_center_scene = self.mapToScene(current_center_view)
+
+        scene_before = self.mapToScene(QPoint(int(current_center_view.x()), int(current_center_view.y())))
+        scene_after = self.mapToScene(QPoint(int(current_center_view.x() + dx), int(current_center_view.y() + dy)))
+        scene_delta = scene_after - scene_before
+
+        new_center = current_center_scene + (scene_delta * speed)
+        self.centerOn(new_center)
+        self.pan_offset = new_center
+        self.contentChanged.emit()
 
     def reset_zoom(self):
         self.resetTransform()
@@ -773,7 +837,7 @@ class MainWindow(QMainWindow):
 
         info = QLabel(
             "Input / drawing window\n"
-            "- Right-click returns to Select / Edit\n"
+            "- Right-click drag pans the input view\n"
             "- Mouse wheel or touchpad zoom only affects the input view\n"
             "- Double-click finishes freehand polygon\n"
             "- Ctrl+Z undo, Ctrl+Y redo, Ctrl+S save, Ctrl+O load"
