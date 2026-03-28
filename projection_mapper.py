@@ -6,7 +6,7 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 SCENE_W = 1280
 SCENE_H = 720
 HANDLE_SIZE_INPUT = 10.0
-HANDLE_SIZE_OUTPUT = 4.0
+HANDLE_SIZE_OUTPUT = 6.0
 MIN_SHAPE_SIZE = 8.0
 OUTPUT_HANDLE_SHOW_DISTANCE = 18.0
 MAX_HISTORY = 120
@@ -72,6 +72,8 @@ class EditableShapeItem(QGraphicsObject):
     changed = Signal()
     editStarted = Signal()
     editFinished = Signal()
+
+    EDGE_INSERT_DISTANCE = 10.0
 
     def __init__(
         self,
@@ -196,6 +198,21 @@ class EditableShapeItem(QGraphicsObject):
             self.editStarted.emit()
             event.accept()
             return
+
+        if self.kind == "polygon" and self.isSelected():
+            seg_idx, projected = self.segment_near(event.pos(), self.EDGE_INSERT_DISTANCE)
+            if seg_idx is not None and projected is not None:
+                self.prepareGeometryChange()
+                self.editStarted.emit()
+                self._points.insert(seg_idx + 1, projected)
+                self.selected_handle = seg_idx + 1
+                self.dragging_handle = True
+                self._editing_started = True
+                self.update()
+                self.changed.emit()
+                event.accept()
+                return
+
         self.dragging_handle = False
         self.selected_handle = None
         self._drag_started = True
@@ -246,6 +263,39 @@ class EditableShapeItem(QGraphicsObject):
             if r.contains(pos):
                 return i
         return None
+
+    def _distance_point_to_segment(self, p: QPointF, a: QPointF, b: QPointF) -> Tuple[float, QPointF]:
+        ax, ay = a.x(), a.y()
+        bx, by = b.x(), b.y()
+        px, py = p.x(), p.y()
+        abx = bx - ax
+        aby = by - ay
+        ab_len_sq = abx * abx + aby * aby
+        if ab_len_sq <= 1e-9:
+            projected = QPointF(ax, ay)
+            return math.hypot(px - ax, py - ay), projected
+        t = ((px - ax) * abx + (py - ay) * aby) / ab_len_sq
+        t = clamp(t, 0.0, 1.0)
+        projected = QPointF(ax + t * abx, ay + t * aby)
+        return math.hypot(px - projected.x(), py - projected.y()), projected
+
+    def segment_near(self, pos: QPointF, threshold: float) -> Tuple[Optional[int], Optional[QPointF]]:
+        if self.kind != "polygon" or len(self._points) < 2:
+            return None, None
+        best_idx: Optional[int] = None
+        best_projected: Optional[QPointF] = None
+        best_dist = float("inf")
+        for i in range(len(self._points)):
+            a = self._points[i]
+            b = self._points[(i + 1) % len(self._points)]
+            dist, projected = self._distance_point_to_segment(pos, a, b)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+                best_projected = projected
+        if best_dist <= threshold:
+            return best_idx, best_projected
+        return None, None
 
     def update_handle(self, idx: int, pos: QPointF):
         pos = self._clamp_point(pos)
@@ -346,6 +396,9 @@ class CanvasView(QGraphicsView):
         self.temp_points: List[QPointF] = []
         self.temp_rect_start: Optional[QPointF] = None
         self.temp_rect_current: Optional[QPointF] = None
+        self.last_scene_mouse_pos = QPointF(SCENE_W / 2, SCENE_H / 2)
+        self.temp_polygon_undo_stack: List[List[QPointF]] = []
+        self.temp_polygon_redo_stack: List[List[QPointF]] = []
         self.zoom_factor = 1.0
         self.pan_offset = QPointF(0, 0)
 
@@ -360,8 +413,43 @@ class CanvasView(QGraphicsView):
         self.temp_points.clear()
         self.temp_rect_start = None
         self.temp_rect_current = None
+        self.temp_polygon_undo_stack.clear()
+        self.temp_polygon_redo_stack.clear()
         self.viewport().update()
         self.contentChanged.emit()
+
+    def _clone_points(self, points: List[QPointF]) -> List[QPointF]:
+        return [QPointF(p) for p in points]
+
+    def _push_temp_polygon_history(self):
+        self.temp_polygon_undo_stack.append(self._clone_points(self.temp_points))
+        if len(self.temp_polygon_undo_stack) > MAX_HISTORY:
+            self.temp_polygon_undo_stack = self.temp_polygon_undo_stack[-MAX_HISTORY:]
+        self.temp_polygon_redo_stack.clear()
+
+    def _refresh_polygon_preview_tail(self):
+        if self.current_tool == "polygon" and self.temp_points:
+            self.temp_points[-1] = QPointF(self.last_scene_mouse_pos)
+
+    def undo_temp_polygon(self) -> bool:
+        if self.current_tool != "polygon" or not self.temp_polygon_undo_stack:
+            return False
+        self.temp_polygon_redo_stack.append(self._clone_points(self.temp_points))
+        self.temp_points = self.temp_polygon_undo_stack.pop()
+        self._refresh_polygon_preview_tail()
+        self.viewport().update()
+        self.contentChanged.emit()
+        return True
+
+    def redo_temp_polygon(self) -> bool:
+        if self.current_tool != "polygon" or not self.temp_polygon_redo_stack:
+            return False
+        self.temp_polygon_undo_stack.append(self._clone_points(self.temp_points))
+        self.temp_points = self.temp_polygon_redo_stack.pop()
+        self._refresh_polygon_preview_tail()
+        self.viewport().update()
+        self.contentChanged.emit()
+        return True
 
     def drawForeground(self, painter: QPainter, rect: QRectF):
         super().drawForeground(painter, rect)
@@ -389,6 +477,7 @@ class CanvasView(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
+        self.last_scene_mouse_pos = QPointF(scene_pos)
         self.cursorMovedInScene.emit(scene_pos)
         if self.current_tool == "polygon" and self.temp_points:
             self.temp_points[-1] = scene_pos
@@ -416,6 +505,7 @@ class CanvasView(QGraphicsView):
 
         if event.button() == Qt.MouseButton.LeftButton:
             if self.current_tool == "polygon":
+                self._push_temp_polygon_history()
                 if not self.temp_points:
                     self.temp_points = [scene_pos, scene_pos]
                 else:
@@ -1008,6 +1098,8 @@ class MainWindow(QMainWindow):
             self.push_history(label)
 
     def undo(self):
+        if self.canvas.undo_temp_polygon():
+            return
         if len(self.undo_stack) <= 1:
             return
         current = self.undo_stack.pop()
@@ -1015,6 +1107,8 @@ class MainWindow(QMainWindow):
         self.restore_state(self.undo_stack[-1].payload)
 
     def redo(self):
+        if self.canvas.redo_temp_polygon():
+            return
         if not self.redo_stack:
             return
         state = self.redo_stack.pop()
